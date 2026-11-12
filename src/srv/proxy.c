@@ -40,6 +40,8 @@ typedef struct pconn {
     int               mode;
     int               close_sent;   /* we already sent CLOSE to channel */
     int               browser_eof;
+    uint64_t          inflight;     /* DATA sent, unacked by the peer (v2) */
+    uint32_t          credit;       /* consumed bytes pending ACK to peer */
     uint8_t          *hbuf;         /* request head accumulation */
     size_t            hlen;
     size_t            hcap;
@@ -156,11 +158,17 @@ static void send_simple(SOCKET s, int code, const char *reason)
     }
 }
 
+/* v2 flow control forward decls (helpers live below is_killed) */
+static void pconn_add_inflight(pconn *c, size_t n);
+
 /* emit sink for the http rewriter */
 static int conn_emit(void *ctx, const void *data, size_t n)
 {
     pconn *c = (pconn *)ctx;
-    return rdpch_send_data_frames(P.xp, c->id, data, n);
+    if (rdpch_send_data_frames(P.xp, c->id, data, n) != 0)
+        return -1;
+    pconn_add_inflight(c, n); /* v2 flow window */
+    return 0;
 }
 
 /* ---- connection worker ---- */
@@ -362,6 +370,61 @@ static int is_killed(pconn *c)
     return k;
 }
 
+/* ---- v2 receiver-side flow control ----
+ *
+ * The sender side of a conn pauses its socket reads while the peer has
+ * not acknowledged more than RDPCH_FLOW_WINDOW of our DATA; the
+ * receiver credits the peer as its local app consumes bytes from
+ * to_sock.  A slow consumer therefore throttles the far end via its
+ * own TCP instead of overflowing to_sock (which kills the conn - the
+ * large-transfer disconnect bug).  inflight is accounted at every site
+ * that emits DATA frames (tunnel recv, rewriter emit, early tunnel
+ * bytes), so MODE_HTTP rewriting cannot skew the window. */
+
+static int pconn_inflight_over(pconn *c)
+{
+    int over;
+
+    EnterCriticalSection(&c->lock);
+    over = c->inflight > RDPCH_FLOW_WINDOW;
+    LeaveCriticalSection(&c->lock);
+    return over;
+}
+
+static void pconn_add_inflight(pconn *c, size_t n)
+{
+    EnterCriticalSection(&c->lock);
+    c->inflight += (uint64_t)n;
+    LeaveCriticalSection(&c->lock);
+}
+
+/* peer consumed app data: reopen its window */
+static void pconn_apply_credit(pconn *c, uint32_t credit)
+{
+    EnterCriticalSection(&c->lock);
+    c->inflight = c->inflight > (uint64_t)credit
+                      ? c->inflight - (uint64_t)credit
+                      : 0;
+    LeaveCriticalSection(&c->lock);
+    SetEvent(c->ev_buf); /* rekick a sender paused on the window */
+}
+
+/* credit the peer for bytes our app consumed (batched: one small ACK
+ * frame per RDPCH_FLOW_ACK_CHUNK consumed) */
+static void pconn_maybe_ack(pconn *c)
+{
+    uint32_t credit = 0;
+
+    EnterCriticalSection(&c->lock);
+    if (c->credit >= RDPCH_FLOW_ACK_CHUNK) {
+        credit = c->credit;
+        c->credit = 0;
+    }
+    LeaveCriticalSection(&c->lock);
+    if (credit)
+        rdpch_send_ack(P.xp, c->id, credit);
+}
+
 /* classify + OPEN + reply/init the rewriter.  0 = relaying. */
 static int setup_relay(pconn *c, size_t head_end)
 {
@@ -476,6 +539,7 @@ static int setup_relay(pconn *c, size_t head_end)
             c->close_sent = 1;
             return -1;
         }
+        pconn_add_inflight(c, c->hlen - head_end); /* v2 flow window */
     }
 
     free(c->hbuf);
@@ -504,9 +568,14 @@ static int drain_to_browser(pconn *c)
             return 0;
         }
         n = send(c->sock, (const char *)seg, (int)seglen, 0);
-        if (n > 0)
+        if (n > 0) {
             bc_consume(&c->to_sock, (size_t)n);
+            c->credit += (uint32_t)n; /* flow-control credit to peer */
+        }
         LeaveCriticalSection(&c->lock);
+
+        if (n > 0)
+            pconn_maybe_ack(c);
 
         if (n == SOCKET_ERROR) {
             if (WSAGetLastError() == WSAEWOULDBLOCK)
@@ -538,7 +607,9 @@ static void drain_then_shutdown(pconn *c)
         if (n > 0) {
             EnterCriticalSection(&c->lock);
             bc_consume(&c->to_sock, (size_t)n);
+            c->credit += (uint32_t)n;
             LeaveCriticalSection(&c->lock);
+            pconn_maybe_ack(c);
             continue;
         }
         if (n != SOCKET_ERROR || WSAGetLastError() != WSAEWOULDBLOCK)
@@ -650,17 +721,21 @@ static unsigned __stdcall conn_thread(void *arg)
                         if (n > 0) {
                             int rc;
                             /* Pace bulk request bodies against the
-                             * channel queue: a slow RDP link must
-                             * throttle the browser via TCP backpressure
-                             * long before the send queue fills (a full
-                             * queue fails send() and reads as a dead
-                             * channel).  Keep draining to_browser while
-                             * waiting so the reverse direction cannot
-                             * overflow either. */
+                             * channel queue AND the peer's receive
+                             * window: a slow RDP link throttles the
+                             * browser via backlog_bytes; a slow
+                             * client-side app (disk, AV scan) throttles
+                             * it via the peer's ACK credits.  Both
+                             * leave TCP backpressure to do the
+                             * end-to-end throttling long before
+                             * anything overflows.  Keep draining
+                             * to_browser while waiting so the reverse
+                             * direction cannot overflow either. */
                             while (!P.stopping && !is_killed(c) &&
-                                   P.xp->ops->backlog_bytes &&
-                                   P.xp->ops->backlog_bytes(P.xp) >
-                                       RDPCH_SEND_BACKLOG_MAX) {
+                                   ((P.xp->ops->backlog_bytes &&
+                                     P.xp->ops->backlog_bytes(P.xp) >
+                                         RDPCH_SEND_BACKLOG_MAX) ||
+                                    pconn_inflight_over(c))) {
                                 if (drain_to_browser(c) != 0) {
                                     dead = 1;
                                     break;
@@ -671,10 +746,13 @@ static unsigned __stdcall conn_thread(void *arg)
                                 break;
                             if (c->mode == MODE_HTTP)
                                 rc = htrw_feed(&c->rw, buf, (size_t)n);
-                            else
+                            else {
                                 rc = rdpch_send_data_frames(P.xp, c->id,
                                                              buf,
                                                              (size_t)n);
+                                if (rc == 0)
+                                    pconn_add_inflight(c, (size_t)n);
+                            }
                             if (rc != 0) {
                                 send_close(c->id, RDPCH_CLOSE_ERROR);
                                 c->close_sent = 1;
@@ -887,6 +965,23 @@ static void on_data(const rdpch_frame *f)
     pconn_unref(c);
 }
 
+/* peer consumed app data we sent: reopen its flow window (v2) */
+static void on_ack(const rdpch_frame *f)
+{
+    pconn *c = table_ref(f->conn_id);
+
+    if (!c)
+        return; /* late frame for a dead connection */
+    if (f->length >= 4) {
+        uint32_t credit = (uint32_t)f->payload[0] |
+                          ((uint32_t)f->payload[1] << 8) |
+                          ((uint32_t)f->payload[2] << 16) |
+                          ((uint32_t)f->payload[3] << 24);
+        pconn_apply_credit(c, credit);
+    }
+    pconn_unref(c);
+}
+
 static void on_close(const rdpch_frame *f)
 {
     pconn *c = table_ref(f->conn_id);
@@ -917,6 +1012,9 @@ static void proxy_on_frame(void *user, const rdpch_frame *f)
         break;
     case RDPCH_CMD_CLOSE:
         on_close(f);
+        break;
+    case RDPCH_CMD_ACK:
+        on_ack(f);
         break;
     default:
         break;

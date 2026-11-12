@@ -58,6 +58,17 @@ typedef struct rdpch_xport rdpch_xport;
  * stay unreachable in normal operation. */
 #define RDPCH_SEND_BACKLOG_MAX (1024u * 1024u)
 
+/* Receiver-side flow control (v2).  A DATA receiver credits its peer
+ * with the bytes its local app actually consumed from the to_sock
+ * buffer (RDPCH_CMD_ACK).  A sender stops reading its app socket while
+ * per-conn unacked data exceeds RDPCH_FLOW_WINDOW, so a slow consumer
+ * throttles the far end through the tunnel instead of overflowing the
+ * 4 MB sink buffer (which kills the conn - the old large-transfer
+ * disconnect bug).  Sizing: window + ack chunk stays well under
+ * sock_buf_max (4 MB), so the overflow kill valve is a backstop only. */
+#define RDPCH_FLOW_WINDOW     (2u * 1024u * 1024u)
+#define RDPCH_FLOW_ACK_CHUNK  (512u * 1024u)
+
 typedef struct rdpch_xport_ops {
     int    (*start)(rdpch_xport *x);
     int    (*send)(rdpch_xport *x, const void *frame, size_t len);
@@ -112,5 +123,10 @@ size_t rdpch_link_hello_frame(uint8_t *out, size_t cap);
  * Stops and returns -1 on the first send failure. */
 int rdpch_send_data_frames(rdpch_xport *x, uint32_t conn_id,
                            const void *buf, size_t n);
+
+/* Emit an ACK credit frame for conn_id (receiver->sender flow
+ * control).  0 ok, -1 transport refused (harmless: the conn dies with
+ * the channel anyway). */
+int rdpch_send_ack(rdpch_xport *x, uint32_t conn_id, uint32_t credit);
 
 #endif /* RDPCH_TRANSPORT_H */

@@ -24,7 +24,7 @@
 #define RDPCH_MAX_PAYLOAD       1400u
 #define RDPCH_MAX_FRAME         (RDPCH_FRAME_HEADER_SIZE + RDPCH_MAX_PAYLOAD)
 
-#define RDPCH_PROTO_VERSION 1
+#define RDPCH_PROTO_VERSION 2
 #define RDPCH_HOST_MAX      253
 
 /* commands */
@@ -38,6 +38,9 @@ enum {
     RDPCH_CMD_PING      = 7,
     RDPCH_CMD_PONG      = 8,
     RDPCH_CMD_BYE       = 9,
+    /* v2: per-conn credit for receiver-side flow control (payload:
+     * u32 LE, bytes the receiver's app consumed since the last ACK) */
+    RDPCH_CMD_ACK       = 10,
 };
 
 /* OPEN_FAIL reasons */

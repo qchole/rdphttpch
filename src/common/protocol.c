@@ -45,7 +45,7 @@ void rdpch_parser_reset(rdpch_parser *p)
 
 int rdpch_cmd_is_valid(uint8_t cmd)
 {
-    return cmd >= RDPCH_CMD_HELLO && cmd <= RDPCH_CMD_BYE;
+    return cmd >= RDPCH_CMD_HELLO && cmd <= RDPCH_CMD_ACK;
 }
 
 int rdpch_parser_feed(rdpch_parser *p, const void *data, size_t len)

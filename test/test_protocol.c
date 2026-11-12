@@ -166,7 +166,7 @@ static void test_open_hello_codec(void)
     CHECK(rdpch_hello_encode(pl, sizeof(pl), &n) == 0 && n == 6);
     CHECK(rdpch_hello_check(pl, 6) == 0);
     CHECK(rdpch_hello_check(pl, 5) == -1);
-    pl[0] = 2; /* wrong version */
+    pl[0] = RDPCH_PROTO_VERSION + 1; /* wrong version */
     CHECK(rdpch_hello_check(pl, 6) == -1);
 
     CHECK(rdpch_open_encode(pl, sizeof(pl), &n, 8080, "example.com", 11) == 0);

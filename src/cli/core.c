@@ -16,7 +16,7 @@ typedef struct cconn {
     struct cconn     *next;
     uint32_t          id;
     volatile LONG     refs;      /* table(1) + worker thread(1) + routers */
-    CRITICAL_SECTION  lock;      /* to_sock + killed + peer_eof */
+    CRITICAL_SECTION  lock;      /* to_sock + killed + peer_eof + flow */
     bufchain          to_sock;   /* channel -> socket */
     SOCKET            sock;
     HANDLE            ev_sock;   /* manual-reset WSA network event */
@@ -24,6 +24,8 @@ typedef struct cconn {
     HANDLE            ev_kill;   /* manual: kill connection */
     volatile LONG     killed;
     volatile LONG     peer_eof;  /* channel sent CLOSE(EOF): upstream done */
+    uint64_t          inflight;  /* DATA sent, unacked by the peer (v2) */
+    uint32_t          credit;    /* consumed bytes pending ACK to peer */
     char              host[256];
     uint16_t          port;
     HANDLE            thread;
@@ -262,6 +264,9 @@ static int conn_connect_phase(cconn *c)
     return 0;
 }
 
+/* v2 flow control: batched consume-credit flush to the peer */
+static void conn_maybe_ack(cconn *c);
+
 /* returns -1 when the socket died.  Delivers every byte already
  * accepted from the channel, even when the conn is being killed: the
  * frames arrived before the CLOSE, dropping the tail corrupts the
@@ -280,9 +285,14 @@ static int conn_drain_to_sock(cconn *c)
             return 0;
         }
         n = send(c->sock, (const char *)seg, (int)seglen, 0);
-        if (n > 0)
+        if (n > 0) {
             bc_consume(&c->to_sock, (size_t)n);
+            c->credit += (uint32_t)n; /* flow-control credit to peer */
+        }
         LeaveCriticalSection(&c->lock);
+
+        if (n > 0)
+            conn_maybe_ack(c);
 
         if (n == SOCKET_ERROR) {
             if (WSAGetLastError() == WSAEWOULDBLOCK)
@@ -310,6 +320,59 @@ static int conn_peer_eof(cconn *c)
     e = c->peer_eof;
     LeaveCriticalSection(&c->lock);
     return e;
+}
+
+/* ---- v2 receiver-side flow control ----
+ *
+ * The sender side of a conn pauses its socket reads while the peer has
+ * not acknowledged more than RDPCH_FLOW_WINDOW of our DATA; the
+ * receiver credits the peer as its local app consumes bytes from
+ * to_sock.  A slow consumer therefore throttles the far end via its
+ * own TCP instead of overflowing to_sock (which kills the conn - the
+ * large-transfer disconnect bug). */
+
+static int conn_inflight_over(cconn *c)
+{
+    int over;
+
+    EnterCriticalSection(&c->lock);
+    over = c->inflight > RDPCH_FLOW_WINDOW;
+    LeaveCriticalSection(&c->lock);
+    return over;
+}
+
+static void conn_add_inflight(cconn *c, size_t n)
+{
+    EnterCriticalSection(&c->lock);
+    c->inflight += (uint64_t)n;
+    LeaveCriticalSection(&c->lock);
+}
+
+/* peer consumed app data: reopen its window */
+static void conn_apply_credit(cconn *c, uint32_t credit)
+{
+    EnterCriticalSection(&c->lock);
+    c->inflight = c->inflight > (uint64_t)credit
+                      ? c->inflight - (uint64_t)credit
+                      : 0;
+    LeaveCriticalSection(&c->lock);
+    SetEvent(c->ev_buf); /* rekick a sender paused on the window */
+}
+
+/* credit the peer for bytes our app consumed (batched: one small ACK
+ * frame per RDPCH_FLOW_ACK_CHUNK consumed) */
+static void conn_maybe_ack(cconn *c)
+{
+    uint32_t credit = 0;
+
+    EnterCriticalSection(&c->lock);
+    if (c->credit >= RDPCH_FLOW_ACK_CHUNK) {
+        credit = c->credit;
+        c->credit = 0;
+    }
+    LeaveCriticalSection(&c->lock);
+    if (credit)
+        rdpch_send_ack(C.xp, c->id, credit);
 }
 
 static unsigned __stdcall conn_thread(void *arg)
@@ -348,17 +411,20 @@ static unsigned __stdcall conn_thread(void *arg)
                         int n = recv(c->sock, buf, sizeof(buf), 0);
                         if (n > 0) {
                             /* Pace bulk uploads against the channel
-                             * queue: a slow RDP link must throttle
-                             * this socket via TCP backpressure long
-                             * before the send queue fills (a full
-                             * queue fails send() and reads as a dead
-                             * channel).  Keep draining to_sock while
-                             * waiting so the reverse direction cannot
-                             * overflow either. */
+                             * queue AND the peer's receive window: a
+                             * slow RDP link throttles this socket via
+                             * backlog_bytes; a slow target app (disk,
+                             * AV scan) throttles it via the peer's ACK
+                             * credits.  Both leave TCP backpressure to
+                             * do the end-to-end throttling long before
+                             * anything overflows.  Keep draining
+                             * to_sock while waiting so the reverse
+                             * direction cannot overflow either. */
                             while (!C.stopping && !conn_killed(c) &&
-                                   C.xp->ops->backlog_bytes &&
-                                   C.xp->ops->backlog_bytes(C.xp) >
-                                       RDPCH_SEND_BACKLOG_MAX) {
+                                   ((C.xp->ops->backlog_bytes &&
+                                     C.xp->ops->backlog_bytes(C.xp) >
+                                         RDPCH_SEND_BACKLOG_MAX) ||
+                                    conn_inflight_over(c))) {
                                 if (conn_drain_to_sock(c) != 0) {
                                     dead = 1;
                                     break;
@@ -372,6 +438,7 @@ static unsigned __stdcall conn_thread(void *arg)
                                 dead = 1; /* channel gone */
                                 break;
                             }
+                            conn_add_inflight(c, (size_t)n);
                             if (++chunks >= 64)
                                 break; /* yield to conn_drain_to_sock */
                             continue;
@@ -524,6 +591,23 @@ static void on_data(const rdpch_frame *f)
     conn_unref(c);
 }
 
+/* peer consumed app data we sent: reopen its flow window (v2) */
+static void on_ack(const rdpch_frame *f)
+{
+    cconn *c = table_ref(f->conn_id);
+
+    if (!c)
+        return; /* late frame for a dead connection */
+    if (f->length >= 4) {
+        uint32_t credit = (uint32_t)f->payload[0] |
+                          ((uint32_t)f->payload[1] << 8) |
+                          ((uint32_t)f->payload[2] << 16) |
+                          ((uint32_t)f->payload[3] << 24);
+        conn_apply_credit(c, credit);
+    }
+    conn_unref(c);
+}
+
 static void on_close(const rdpch_frame *f)
 {
     cconn *c = table_ref(f->conn_id);
@@ -563,6 +647,9 @@ static void core_on_frame(void *user, const rdpch_frame *f)
         break;
     case RDPCH_CMD_CLOSE:
         on_close(f);
+        break;
+    case RDPCH_CMD_ACK:
+        on_ack(f);
         break;
     case RDPCH_CMD_OPEN_OK:
     case RDPCH_CMD_OPEN_FAIL:

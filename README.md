@@ -188,13 +188,23 @@ test\mock_e2e.cmd
 ```
 帧 = conn_id(u32 LE) | cmd(u8) | length(u32 LE) | payload(0..1400B)
 cmd: 1=HELLO 2=OPEN 3=OPEN_OK 4=OPEN_FAIL 5=DATA 6=CLOSE 7=PING 8=PONG 9=BYE
-HELLO: ver(2B=1)+max_payload(2B)+reserved(2B),通道每次建立各发一次
+     10=ACK(v2 新增)
+HELLO: ver(2B=2)+max_payload(2B)+reserved(2B),通道每次建立各发一次
 OPEN:  port(2B)+hostlen(2B)+host(域名在客户端解析)
 OPEN_FAIL reason: 1=DNS 2=REFUSED 3=TIMEOUT 4=LIMIT 5=PROTO
 CLOSE reason: 0=EOF 1=ERROR 2=OVERFLOW
+ACK payload: credit(u32 LE),按 conn_id 归属
 conn_id 由服务端从 1 递增分配,0 保留给控制帧
 非法 cmd / length>1400 → 协议错误杀传输(流上无法重同步)
+HELLO 版本号必须一致:v1/v2 混部时 HELLO 被拒,链路无法建立(日志有 WARN)
 ```
+
+**接收方向流控(v2,与 tcpch 同步引入)**:DATA 接收方按本地应用实际消费量
+(每 512KB 一帧)回 ACK credit;发送方单连接未确认字节超过 2MB 即暂停读本地
+socket,由 TCP 背压逐级回传。慢消费者(慢磁盘/杀软扫描/浏览器卡顿)只会拖慢
+传输,不再冲爆接收缓冲(4MB)触发 CLOSE_OVERFLOW 杀连接——这是"经通道代理
+传大文件偶发断开"的修复。srv 与 cli 必须成对升级。MODE_HTTP 下 inflight
+记账挂在重写器输出处(conn_emit),隧道/重写两条路径同窗口。
 
 **握手与重同步语义**(传输层,两端一致):
 

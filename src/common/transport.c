@@ -49,6 +49,10 @@ static void link_frame(void *user, const rdpch_frame *f)
          * of killing the link (the old behavior caused a flap loop:
          * every client frame after a server bounce murdered the
          * channel again). */
+        if (f->cmd == RDPCH_CMD_HELLO)
+            RLOGW("link: peer HELLO version mismatch (need v%u) - "
+                  "upgrade rdpchsrv and rdpchcli together",
+                  RDPCH_PROTO_VERSION);
         RLOGD("link: pre-hello frame conn=%u cmd=%u dropped (peer restart)",
               f->conn_id, f->cmd);
         return;
@@ -110,4 +114,23 @@ int rdpch_send_data_frames(rdpch_xport *x, uint32_t conn_id,
         n -= chunk;
     }
     return 0;
+}
+
+int rdpch_send_ack(rdpch_xport *x, uint32_t conn_id, uint32_t credit)
+{
+    uint8_t frame[RDPCH_FRAME_HEADER_SIZE + 4];
+    uint8_t payload[4];
+    size_t built;
+
+    if (credit == 0)
+        return 0;
+    payload[0] = (uint8_t)credit;
+    payload[1] = (uint8_t)(credit >> 8);
+    payload[2] = (uint8_t)(credit >> 16);
+    payload[3] = (uint8_t)(credit >> 24);
+    built = rdpch_frame_build(frame, sizeof(frame), conn_id, RDPCH_CMD_ACK,
+                              payload, 4);
+    if (built == 0)
+        return -1;
+    return x->ops->send(x, frame, built);
 }

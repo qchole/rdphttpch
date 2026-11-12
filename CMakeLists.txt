@@ -76,6 +76,17 @@ target_include_directories(test_backpressure PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
 target_link_libraries(test_backpressure PRIVATE rdpch_common)
 add_test(NAME backpressure COMMAND test_backpressure)
 
+# e2e: receiver-side backpressure (large-transfer disconnect family);
+# drives the real srv+cli engines over the mock carrier in one process
+add_executable(test_flowcontrol test/test_flowcontrol.c
+    src/srv/proxy.c src/srv/http_rewrite.c src/srv/channel_mock.c
+    src/cli/core.c src/cli/transport_tcp.c
+)
+target_include_directories(test_flowcontrol PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/srv ${CMAKE_CURRENT_SOURCE_DIR}/src/cli)
+target_link_libraries(test_flowcontrol PRIVATE rdpch_common)
+add_test(NAME flowcontrol COMMAND test_flowcontrol)
+
 add_executable(test_vc test/test_vc.c src/cli/transport_vc.c)
 target_include_directories(test_vc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/cli)
 target_link_libraries(test_vc PRIVATE rdpch_common)
